@@ -8,7 +8,12 @@ import matplotlib.pyplot as plt
 from aliases import *
 
 
-def get_energy_function(device: torch.device, sparse: bool = False) -> nn.Module:
+def get_energy_function(
+    device: torch.device,
+    sparse: bool = False,
+    discrete_energy: bool = False,
+    n_bins_per_dim: int = 20,  # for discrete_energy == True
+) -> nn.Module:
     if sparse:
         loc = torch.cartesian_prod(
             torch.tensor([-0.3, 0.0, 0.3], device=device),
@@ -32,7 +37,10 @@ def get_energy_function(device: torch.device, sparse: bool = False) -> nn.Module
     components = Independent(Normal(loc, scale), 1)  # [batch_shape: (5, 2), event_shape: (,)] -> [batch_shape: (5,), event_shape: (2,)]
     mixture_probs = Categorical(torch.ones(n_components, device=device))
     gmm = MixtureSameFamily(mixture_probs, components)
-    return EnergyModel(gmm)
+    if discrete_energy:
+        return DiscreteEnergyModel(gmm, n_bins_per_dim)
+    else:
+        return EnergyModel(gmm)
 
 
 class EnergyModel(nn.Module):
@@ -57,31 +65,29 @@ class EnergyModel(nn.Module):
 
 class DiscreteEnergyModel(nn.Module):
     """Discretize a gmm"""
-    def __init__(self, gmm: MixtureSameFamily):
+    def __init__(self, gmm: MixtureSameFamily, n_bins_per_dim: int):
         super().__init__()
         self.gmm = gmm
+        self.n_bins_per_dim = n_bins_per_dim
 
         grid = torch.cartesian_prod(
-            torch.linspace(-0.5, 0.5, steps=10),
-            torch.linspace(-0.5, 0.5, steps=10)
+            torch.linspace(-0.5, 0.5, steps=self.n_bins_per_dim),
+            torch.linspace(-0.5, 0.5, steps=self.n_bins_per_dim)
         )  # (100, 2)
-        energies = -gmm.log_prob(grid).reshape(-1)
+        energies = -gmm.log_prob(grid).reshape(self.n_bins_per_dim, self.n_bins_per_dim)
         self.register_buffer("energies", energies)
+        # (self.n_bins_per_dim, self.n_bins_per_dim)
 
-    def forward(self, indices: Tensor) -> Tensor:
+    def forward(self, x_indices: Tensor, y_indices: Tensor) -> Tensor:
         """
         Args:
-            indices: torch.long
+            x_indices: torch.long
                 shape (batch_size,)
 
         Returns:
             shape (batch_size,)
         """
-        assert (
-            indices.dtype == torch.long
-            and 0 <= indices <= self.energies.numel() - 1
-        )
-        return self.energies[indices]
+        return self.energies[x_indices, y_indices]
 
 
 @torch.no_grad()

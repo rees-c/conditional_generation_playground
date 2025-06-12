@@ -78,6 +78,7 @@ class DiscreteEnergyModel(nn.Module):
         energies = -gmm.log_prob(grid).reshape(self.n_bins_per_dim, self.n_bins_per_dim)
         self.register_buffer("energies", energies)
         # (self.n_bins_per_dim, self.n_bins_per_dim)
+        self.register_buffer("normalizing_constant", torch.exp(-self.energies).sum())
 
     def forward(self, x_indices: Tensor, y_indices: Tensor) -> Tensor:
         """

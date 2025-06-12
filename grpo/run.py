@@ -29,27 +29,29 @@ def plot_current_policy(
         torch.linspace(-0.5, 0.5, steps=n_bins_per_dim)
     )  # (100, 2)
     assert torch.isclose(grid, grid2).all()
-    target_dist = energy_fn.gmm.log_prob(grid).exp()
+    target_dist = torch.exp(-energy_fn.energies) / energy_fn.normalizing_constant
     # x_indices, y_indices, _ = policy.sample_and_probs(100)
 
-    fig, axs = plt.subplots(ncols=2, figsize=(8, 4))
-    axs[0].pcolormesh(
+    fig, axs = plt.subplots(ncols=2, figsize=(9, 4))
+    im0 = axs[0].pcolormesh(
         grid_x,
         grid_y,
         target_dist.view(n_bins_per_dim, n_bins_per_dim).cpu(),
-        vmin=0.0, vmax=target_dist.max(),
+        vmin=0.0, vmax=target_dist.max()
     )
     axs[0].set_title("Target policy")
+    plt.colorbar(im0, ax=axs[0])
 
     grid_x_indices, grid_y_indices = torch.meshgrid(
         torch.arange(n_bins_per_dim), torch.arange(n_bins_per_dim)
     )
     probs = policy((grid_x_indices.reshape(-1), grid_y_indices.reshape(-1)))
     probs = probs.prod(dim=-1)
-    axs[1].pcolormesh(
+    im1 = axs[1].pcolormesh(
         grid_x, grid_y, probs.view(n_bins_per_dim, n_bins_per_dim).cpu(),
-        vmin=0.0, vmax=target_dist.max(),
+        vmin=0.0, vmax=target_dist.max()
     )
+    plt.colorbar(im1, ax=axs[1])
     axs[1].set_title("Current policy")
     if plot_name is not None:
         plt.savefig(Path(plot_name).with_suffix(".png"))
@@ -70,9 +72,9 @@ def main():
     use_sparse_reward = True
     reward_temperature = 1.0
     use_ema = True
-    old_policy_update_freq = 1 if use_ema else 100
+    old_policy_update_freq = 10 if use_ema else 100
     epsilon = 0.1
-    beta = 0.01
+    beta = 0.1
     n_log_prints = 10
     log_freq = int(num_iterations / n_log_prints)
 

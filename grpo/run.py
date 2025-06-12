@@ -4,8 +4,11 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
+from aliases import *
 from rewards import get_energy_function
+from common_utils import AverageMeter
 from grpo.model import DiscreteModel, DummyUniformModel
+from grpo.utils import update_old_policy, compute_grpo_loss
 
 
 @torch.no_grad()
@@ -41,7 +44,8 @@ def plot_current_policy(
     grid_x_indices, grid_y_indices = torch.meshgrid(
         torch.arange(n_bins_per_dim), torch.arange(n_bins_per_dim)
     )
-    probs = policy(grid_x_indices.reshape(-1), grid_y_indices.reshape(-1))
+    probs = policy((grid_x_indices.reshape(-1), grid_y_indices.reshape(-1)))
+    probs = probs.prod(dim=-1)
     axs[1].pcolormesh(
         grid_x, grid_y, probs.view(n_bins_per_dim, n_bins_per_dim).cpu(),
         vmin=0.0, vmax=target_dist.max(),
@@ -59,34 +63,93 @@ def main():
 
     # hyperparameters
     lr = 1e-3
-    num_iterations = 10_000
+    num_iterations = 3_001
     batch_size = 64
     hidden_dim = 64
     reward_n_bins_per_dim = 20
     use_sparse_reward = True
+    reward_temperature = 1.0
+    use_ema = True
+    old_policy_update_freq = 1 if use_ema else 100
+    epsilon = 0.1
+    beta = 0.01
+    n_log_prints = 10
+    log_freq = int(num_iterations / n_log_prints)
 
+    # -- Reward
     energy_fn: nn.Module = get_energy_function(
         device,
         sparse=use_sparse_reward,
         discrete_energy=True,
         n_bins_per_dim=reward_n_bins_per_dim,
     )
+    reward_fn: Callable = (
+        lambda samples: torch.exp(-energy_fn(samples[0], samples[1]) / reward_temperature)
+    )
+
+    # -- Model
     reference_policy = DummyUniformModel(
-        n_bins_per_dim=reward_n_bins_per_dim, n_dims=2
+        n_bins_per_dim=reward_n_bins_per_dim, n_dims=2, device=device
     )
     policy = DiscreteModel(reward_n_bins_per_dim, hidden_dim=hidden_dim)
     policy.to(device)
+
+    old_policy = DiscreteModel(reward_n_bins_per_dim, hidden_dim=hidden_dim)
+    old_policy.load_state_dict(policy.state_dict())
+    old_policy.eval()
+    for p in old_policy.parameters():
+        p.requires_grad = False
+    old_policy.to(device)
+
+    # -- Optimizer
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+
+    # -- Visualization
+    plot_current_policy(
+        reward_n_bins_per_dim, energy_fn, device, policy,
+        plot_name="discrete_grpo_iter0"
+    )
+
+    # -- Train
+    n_tokens_per_sample = torch.tensor([2] * batch_size, dtype=torch.long, device=device)
+    meters = {"loss": AverageMeter(), "reward": AverageMeter()}
+    for iter in range(num_iterations):
+        samples, probs = old_policy.sample_and_probs(batch_size)
+        # (batch_size,), (batch_size,), (batch_size, n_tokens=2)
+        rewards = reward_fn(samples)
+        # (batch_size,)
+
+        # outcome supervision (see 4.1.2)
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+
+        grpo_loss = compute_grpo_loss(
+            samples,
+            n_tokens_per_sample,
+            advantages,
+            policy,
+            old_policy,
+            reference_policy,
+            epsilon,
+            beta,
+        )
+        grpo_loss.backward()
+        torch.nn.utils.clip_grad_value_(policy.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        meters["loss"].update(grpo_loss.detach().cpu())
+        meters["reward"].update(rewards.mean().detach().cpu())
+        if iter % old_policy_update_freq == 0:
+            update_old_policy(old_policy, policy, use_ema=use_ema)
+        if iter % log_freq == 0:
+            print(f"Iter [{iter}/{num_iterations}]: loss {meters['loss'].avg:0.4f}, reward {meters['reward'].avg:0.4f}")
+            for meter in meters.values():
+                meter.reset()
 
     plot_current_policy(
         reward_n_bins_per_dim, energy_fn, device, policy,
-        plot_name="discrete_grpo_epoch0"
+        plot_name=f"discrete_grpo_iter{iter}"
     )
-
-    for iter in range(num_iterations):
-        loss = ...
 
 
 if __name__ == "__main__":
-    raise NotImplementedError
     main()

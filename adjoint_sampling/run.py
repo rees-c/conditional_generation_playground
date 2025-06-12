@@ -3,7 +3,8 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from rewards import get_energy_function
-from adjoint_sampling.utils import ReplayBuffer, AverageMeter, cycle
+from common_utils import AverageMeter
+from adjoint_sampling.utils import ReplayBuffer, cycle
 from adjoint_sampling.model import DiffusionModel
 
 

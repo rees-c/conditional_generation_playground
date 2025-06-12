@@ -65,6 +65,7 @@ class EnergyModel(nn.Module):
 
 class DiscreteEnergyModel(nn.Module):
     """Discretize a gmm"""
+    @torch.no_grad()
     def __init__(self, gmm: MixtureSameFamily, n_bins_per_dim: int):
         super().__init__()
         self.gmm = gmm

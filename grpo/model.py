@@ -33,7 +33,7 @@ class DiscreteModel(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x_indices: Tensor, y_indices: Tensor) -> Tensor:
+    def forward(self, samples: Tuple[Tensor, Tensor]) -> Tensor:
         """
         Args:
             x_indices: torch.long
@@ -42,8 +42,9 @@ class DiscreteModel(nn.Module):
                 shape (batch_size,)
 
         Returns:
-            shape (batch_size,)
+            shape (batch_size, 2)
         """
+        x_indices, y_indices = samples
         batch_size = x_indices.shape[0]
         device = x_indices.device
 
@@ -65,16 +66,22 @@ class DiscreteModel(nn.Module):
 
         x_probs = x_probs[x_indices]
         y_probs = y_probs[torch.arange(batch_size, device=device), y_indices]
-        probs = x_probs * y_probs
-        return probs  # (batch_size,)
+        probs = torch.stack([x_probs, y_probs], dim=-1)
+        # (batch_size, n_tokens=2)
+        return probs  # (batch_size, n_tokens)
 
-    def sample_and_probs(self, batch_size: int = 1) -> Tuple[Tensor, Tensor, Tensor]:
+    def sample_and_probs(self, batch_size: int = 1) -> Tuple[Tuple[Tensor, Tensor], Tensor]:
         device = self.x_emb.data.device
 
         x_probs = F.softmax(self.x_logit_head(self.x_emb), dim=0).squeeze(dim=-1)
         # (universe_size_per_dim,)
-        x_indices = torch.multinomial(x_probs, batch_size, replacement=True)
-        # (batch_size,)
+        try:
+            x_indices = torch.multinomial(x_probs, batch_size, replacement=True)
+            # (batch_size,)
+        except Exception as e:
+            print(e)
+            breakpoint()
+            raise e
 
         emb = torch.cat(
             [
@@ -89,27 +96,31 @@ class DiscreteModel(nn.Module):
         # (batch_size, universe_size_per_dim, 2 * hidden_dim)
         y_probs = F.softmax(self.y_logit_head(emb).squeeze(dim=-1), dim=1)
         # (batch_size, universe_size_per_dim)
-        y_indices = torch.multinomial(y_probs, 1, replacement=True)
+        y_indices = torch.multinomial(y_probs, 1, replacement=True).view(-1)
         # (batch_size,)
 
         x_probs = x_probs[x_indices]
         y_probs = y_probs[torch.arange(batch_size, device=device), y_indices]
-        probs = x_probs * y_probs
-        return x_indices, y_indices, probs
+        probs = torch.stack([x_probs, y_probs], dim=-1)
+        # (batch_size, n_tokens=2)
+        return (x_indices, y_indices), probs
+        # (batch_size,), (batch_size,), (batch_size, n_tokens)
 
 
 class DummyUniformModel(nn.Module):
-    def __init__(self, n_bins_per_dim: int, n_dims: int = 2):
+    def __init__(self, n_bins_per_dim: int, n_dims: int = 2, device: torch.device = "cpu"):
         super().__init__()
         self.n_bins_per_dim = n_bins_per_dim
         self.n_dims = n_dims
         self.n_bins = n_bins_per_dim * n_dims
+        self.device = device
 
-    def forward(self, batch_size: int, device: torch.device) -> Tensor:
-        return (1.0 / self.n_bins) * torch.ones(batch_size, device=device)
+    def forward(self, samples: Tuple[Tensor, Tensor]) -> Tensor:
+        batch_size = samples[0].shape[0]
+        return (1.0 / self.n_bins) * torch.ones(batch_size, 2, device=self.device)
 
-    def sample_and_probs(self, batch_size: int) -> Tuple[Tensor, Tensor, Tensor]:
-        x_indices = torch.randint(low=0, high=self.n_bins, size=(batch_size,))
-        y_indices = torch.randint(low=0, high=self.n_bins, size=(batch_size,))
+    def sample_and_probs(self, batch_size: int) -> Tuple[Tuple[Tensor, Tensor], Tensor]:
+        x_indices = torch.randint(low=0, high=self.n_bins, size=(batch_size,), device=self.device)
+        y_indices = torch.randint(low=0, high=self.n_bins, size=(batch_size,), device=self.device)
         probs = self(batch_size)
-        return x_indices, y_indices, probs
+        return (x_indices, y_indices), probs

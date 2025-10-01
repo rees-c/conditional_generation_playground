@@ -23,7 +23,7 @@ from torch.distributions import Normal
 import numpy as np
 import matplotlib.pyplot as plt
 
-from common_utils import AverageMeter
+from common_utils import AverageMeter, compute_grad_norm
 from rewards import get_energy_function
 from grpo.utils import update_old_policy
 from diffusion_grpo.model_utils import FourierTimeEmbeddings
@@ -534,9 +534,10 @@ def run(method: str, use_pretrained_model: bool = True):
     batch_size = 64
     use_sparse_reward = False
     reward_temperature = 1.0
-    use_ema = False
-    old_policy_update_freq = 10 if use_ema else 100
-    epsilon = 0.1
+    use_ema = False  # ema leads to no learning
+    ema_decay = 0.99
+    old_policy_update_freq = 1 if use_ema else 100
+    epsilon = 0.1  # 0.2 instead of 0.1 leads to slow learning
     beta = 0.0
     n_log_prints = 10
     num_inner_steps = 4
@@ -548,6 +549,7 @@ def run(method: str, use_pretrained_model: bool = True):
     assert batch_size > 1
 
     config = {
+        "seed": seed,
         "lr": lr, "num_iterations": num_iterations, "batch_size": batch_size,
         "use_sparse_reward": use_sparse_reward,
         "reward_temperature": reward_temperature,
@@ -556,7 +558,9 @@ def run(method: str, use_pretrained_model: bool = True):
         "num_timesteps": num_timesteps, "hidden_dim": hidden_dim,
         "spatial_dim": spatial_dim, "use_pretrained_model": use_pretrained_model,
         "normalize_advantages": normalize_advantages,
+        "ema_decay": ema_decay,
     }
+    print(config)
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f)
 
@@ -598,7 +602,7 @@ def run(method: str, use_pretrained_model: bool = True):
     plot_current_policy(model, reward_fn, device, method, 0)
 
     # -- Train
-    meters = {"loss": AverageMeter(), "reward": AverageMeter()}
+    meters = {"loss": AverageMeter(), "reward": AverageMeter(), "grad": AverageMeter()}
     learning_curves = {"reward": [], "loss": [], "grad_norm": []}
     for iter in range(num_iterations):
         # sample N points from current model, take num_inner_steps
@@ -653,8 +657,15 @@ def run(method: str, use_pretrained_model: bool = True):
             # loss = current_step_log_probs.sum()  # sanity check grad flow
 
             loss.backward()
-            # todo: try ema with higher clipping value or learning rate?
+
+            # grad norm clipping value not super sensitive (0.1 and 1.0 both work)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+
+            # # grad value clip values (1.0 works but very slow convergence,
+            # # 0.1 unstable)
+            # torch.nn.utils.clip_grad_value_(model.parameters(), 0.1)
+            # grad_norm = compute_grad_norm(model)
+
             optimizer.step()
             optimizer.zero_grad()
 
@@ -662,11 +673,12 @@ def run(method: str, use_pretrained_model: bool = True):
             _rewards = rewards.detach().mean().cpu()
             meters["loss"].update(_loss)
             meters["reward"].update(_rewards)
+            meters["grad"].update(grad_norm.detach())
             learning_curves["loss"].append(artifacts['first term'].detach())
             learning_curves["reward"].append(_rewards)
             learning_curves["grad_norm"].append(grad_norm)
         if iter % old_policy_update_freq == 0:
-            update_old_policy(old_policy, model, use_ema=use_ema)
+            update_old_policy(old_policy, model, use_ema=use_ema, decay=ema_decay)
         if iter % log_freq == 0:
             metric_str = (
                 f"Iter [{iter}/{num_iterations}]: "
@@ -674,7 +686,7 @@ def run(method: str, use_pretrained_model: bool = True):
                 f"reward {meters['reward'].avg:0.4f}, "
                 f"first term: {artifacts['first term']:0.4f}, "
                 f"kl loss: {artifacts['kl_loss']:0.4f}, "
-                f"grad norm: {grad_norm:0.3f}"
+                f"grad norm: {meters['grad'].avg:0.8f}"
             )
             print(metric_str)
             for meter in meters.values():

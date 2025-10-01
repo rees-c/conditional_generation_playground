@@ -5,12 +5,12 @@ from aliases import *
 
 
 def update_old_policy(
-    old_policy: nn.Module, new_policy: nn.Module, use_ema: bool = True
+    old_policy: nn.Module, new_policy: nn.Module, use_ema: bool = True, decay: float = 0.99
 ) -> None:
     if use_ema:
         with torch.no_grad():
             for p_old, p_new in zip(old_policy.parameters(), new_policy.parameters()):
-                p_old.data.mul_(0.99).add_(0.01 * p_new.data)
+                p_old.data.mul_(decay).add_((1.-decay) * p_new.data)
     else:
         old_policy.load_state_dict(new_policy.state_dict())
 

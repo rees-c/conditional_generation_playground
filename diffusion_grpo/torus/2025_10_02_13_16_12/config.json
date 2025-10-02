@@ -1,0 +1,1 @@
+{"seed": 42, "lr": 5e-05, "num_iterations": 1001, "batch_size": 64, "use_sparse_reward": false, "reward_temperature": 1.0, "use_ema": false, "old_policy_update_freq": 100, "epsilon": 0.1, "beta": 0.0, "num_inner_steps": 4, "num_timesteps": 100, "hidden_dim": 64, "spatial_dim": 1, "use_pretrained_model": true, "normalize_advantages": false, "ema_decay": 0.99}

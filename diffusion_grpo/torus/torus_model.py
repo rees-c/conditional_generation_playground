@@ -1,4 +1,3 @@
-"""DDPM style with standard gaussian (unwrapped)"""
 seed = 42
 import torch
 torch.manual_seed(seed)
@@ -8,13 +7,14 @@ np.random.seed(seed)
 import random
 random.seed(seed)
 
-import os
+import json
 import math
 from typing import *
 from tqdm import tqdm
-from datetime import datetime
 from pathlib import Path
-import json
+from datetime import datetime
+import os
+import functools
 
 import torch
 import torch.nn as nn
@@ -23,29 +23,58 @@ from torch.distributions import Normal
 import numpy as np
 import matplotlib.pyplot as plt
 
-from common_utils import AverageMeter, compute_grad_norm
+from common_utils import AverageMeter
 from rewards import get_energy_function
 from grpo.utils import update_old_policy
 from diffusion_grpo.model_utils import FourierTimeEmbeddings
 
 Tensor: type = torch.Tensor
 
-output_dir = Path(datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
+parent_dir = Path("torus")
+output_dir = parent_dir / Path(datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
 if not os.path.exists(output_dir):
-    os.mkdir(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-pretrained_model_path = "ckpt.pt"
+pretrained_model_path = parent_dir / "ckpt.pt"
 
 # Model hyperparams
 num_timesteps = 100
 hidden_dim = 64
 spatial_dim = 1
+model_kwargs = {
+    "num_timesteps": num_timesteps, "hidden_dim": hidden_dim,
+    "spatial_dim": spatial_dim
+}
 assert spatial_dim in [1, 2]
 
 
-def gaussian_log_pdf(x: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+m = 3
+translations_1d = torch.arange(-m, m+1, device=device)
+translations = torch.cartesian_prod(*([translations_1d] * spatial_dim))
+@torch.no_grad()
+def wrapped_reward_fn(
+    x: Tensor, energy_fn: Callable, reward_temperature: float = 1.0
+) -> Tensor:
+    """x: shape (B, d)"""
+    spatial_dim = x.shape[-1]
+    device = x.device
+
+    # (n_translations, d)
+    xs = (x % 1.0)[:, None, :] + translations[None, ...].to(x.dtype)
+    # (B, n_translations, d)
+    reward = 10.0 * torch.exp(
+        -energy_fn(xs.view(-1, spatial_dim) - 0.5)
+        / reward_temperature
+    ).view(x.shape[0], translations.shape[0], spatial_dim)
+    reward = reward.mean(dim=1)
+    return reward
+
+
+def wrapped_gaussian_log_pdf(x: Tensor, mean: Tensor, std: Tensor, m: int = 5) -> Tensor:
     """
+    Get log probability + log (unknown) normalizing constant
+
     Args:
         x: (batch_size, 2)
         mean: (batch_size, 2)
@@ -55,12 +84,61 @@ def gaussian_log_pdf(x: Tensor, mean: Tensor, std: Tensor) -> Tensor:
         (batch_size,)
     """
     ndim = x.shape[-1]
+    device = x.device
+
+    translations_1d = torch.arange(-m, m+1, device=device)
+    translations = torch.cartesian_prod(translations_1d, translations_1d)
+    # (n_translations, 2)
+    mean = mean[:, None, :] % 1.0 + translations[None, ...]
+    # (batch_size, n_translations, 2)
+
     std = std.clamp(min=1e-6)
-    return -0.5 * (
+    x = x % 1.0
+
+    log_pdf = -0.5 * (
         ndim * math.log(2. * math.pi)
         + 2 * ndim * torch.log(std)
-        + (x - mean).pow(2).sum(dim=-1) / (std.pow(2))
+        + (x[:, None, :] - mean).pow(2).sum(dim=-1) / std.pow(2)
     )
+    log_pdf = torch.logsumexp(log_pdf, dim=1)
+    return log_pdf
+
+
+def p_wrapped_multivariate_normal(x, sigma, N=10, T=1.0):
+    # x: [..., d]
+    sigma = sigma.clamp(min=1e-6)
+    dims = x.shape[-1]
+    coordinates = [torch.arange(-N, N+1, device=x.device)] * dims
+    meshgrid = torch.meshgrid(coordinates)
+    meshpoints = torch.cat([_.reshape(-1,1) for _ in meshgrid],dim=-1)
+    # (n_translations, d)
+    p_ = 0.
+    for point in meshpoints:
+        p_ += torch.exp(-((x + T * point) ** 2).sum(dim=-1) / 2 / sigma[...,0] ** 2)
+    return p_
+
+
+@torch.no_grad()
+def d_log_p_wrapped_multivariate_normal(x, sigma, N=5, T=1.0):
+    # x: [..., d]
+    dims = x.shape[-1]
+    coordinates = [torch.arange(-N, N+1, device=x.device, dtype=torch.float)] * dims
+    meshgrid = torch.meshgrid(coordinates)
+    meshpoints = torch.cat([_.reshape(-1,1) for _ in meshgrid],dim=-1) # [(2N + 1) ^ d, d]
+    p_ = 0.
+    for point in meshpoints:
+        p_ += (x + T * point) / sigma ** 2 * torch.exp(-((x + T * point) ** 2).sum(dim=-1, keepdim=True) / 2 / sigma ** 2)
+
+    return -p_ / p_wrapped_multivariate_normal(x, sigma, N, T).unsqueeze(-1)
+
+
+@torch.no_grad()
+def sigma_norm(sigma, T=1.0, sn=5000, dims=1):
+    sigmas = sigma[None, :, None].repeat(sn, 1, dims)
+    x_sample = sigmas * torch.randn_like(sigmas)
+    x_sample = x_sample % T
+    normal_ = d_log_p_wrapped_multivariate_normal(x_sample, sigmas, T=T)
+    return (normal_ ** 2).sum(dim=-1).mean(dim=0)
 
 
 def kl_divergence(log_p: Tensor, log_q: Tensor) -> Tensor:
@@ -70,58 +148,36 @@ def kl_divergence(log_p: Tensor, log_q: Tensor) -> Tensor:
     return log_p.exp() * (log_p - log_q)
 
 
-class BetaScheduler(nn.Module):
+class NoiseScheduler(nn.Module):
     def __init__(
         self,
         num_timesteps: int,
-        scheduler_mode: str = "cosine",
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
+        sigma_min: float = 0.01,
+        sigma_max: float = 0.5,
+        device: torch.device = "cpu",
     ):
-        super(BetaScheduler, self).__init__()
+        """
+        Exponential scheduler:
+            sigma_0 = 0                                             if t = 0
+            sigma_t = sigma_1 * (sigma_T / sigma_1)^(t-1 / T-1)     if t > 0
+        """
+        super().__init__()
         self.num_timesteps = num_timesteps
-        if scheduler_mode == 'cosine':
-            # DiffCSP++ uses s=0.008
-            betas = self.cosine_beta_schedule(num_timesteps, s=0.008)
-        elif scheduler_mode == 'linear':
-            betas = self.linear_beta_schedule(num_timesteps, beta_start, beta_end)
-        else:
-            raise AttributeError
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        sigmas = torch.tensor(
+            np.exp(np.linspace(np.log(sigma_min), np.log(sigma_max), num_timesteps)),
+            dtype=torch.float, device=device
+        )
+        # (num_timesteps,)
+        sigmas_norm_ = sigma_norm(sigmas)
 
-        betas = torch.cat([torch.zeros([1]), betas], dim=0)
-        alphas = 1. - betas
-        alpha_bar = torch.cumprod(alphas, axis=0)  # \bar{alpha}
-
-        sigmas = torch.zeros_like(betas)
-
-        # Eqn 4 in DiffCSP++. Standard dev of the noise.
-        sigmas[1:] = betas[1:] * (1. - alpha_bar[:-1]) / (1. - alpha_bar[1:])
-        sigmas = torch.sqrt(sigmas)
-
-        self.register_buffer('betas', betas)
-        # (1 + timesteps,)
-        self.register_buffer('alphas', alphas)
-        # (1 + timesteps,)
-        self.register_buffer('alpha_bar', alpha_bar)
-        # (1 + timesteps,)
-        self.register_buffer('sigmas', sigmas)
-        # (1 + timesteps,)
-
-    @staticmethod
-    def cosine_beta_schedule(timesteps: int, s=0.008):
-        """
-        cosine schedule as proposed in https://arxiv.org/abs/2102.09672
-        """
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)    # shape (timesteps,)
-
-    @staticmethod
-    def linear_beta_schedule(timesteps: int, beta_start: float, beta_end: float):
-        return torch.linspace(beta_start, beta_end, timesteps)
+        self.register_buffer(
+            "sigmas", torch.cat([torch.zeros([1], device=sigmas.device), sigmas], dim=0)
+        )  # (1 + num_timesteps,)
+        self.register_buffer(
+            "sigmas_norm", torch.cat([torch.ones([1]), sigmas_norm_], dim=0)
+        )
 
     def uniform_sample_timestep(self, batch_size: int, device: torch.device):
         return torch.randint(
@@ -131,6 +187,26 @@ class BetaScheduler(nn.Module):
             device=device,
             dtype=torch.long,
         )
+
+
+class TorusMLP(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_freqs: int = 16, ndim: int = 2):
+        super().__init__()
+        self.register_buffer("freqs", torch.linspace(1, num_freqs, num_freqs))
+        self.layers = nn.Sequential(
+            nn.Linear(2 * ndim * num_freqs, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: Tensor):
+        """x: (batch_size, ndim)"""
+        f = self.freqs[None, None, :] * x[..., None]
+        # (batch_size, ndim, freqs)
+        f = torch.cat([f.sin(), f.cos()], dim=-1)
+        # (batch_size, ndim, 2 * freqs)
+        return self.layers(f.view(x.shape[0], -1))  # (batch_size, hidden_dim)
 
 
 class DiffusionModel(nn.Module):
@@ -146,9 +222,9 @@ class DiffusionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.time_dim = time_dim
         self.spatial_dim = spatial_dim
-        self.noise_scheduler = BetaScheduler(num_timesteps)
+        self.noise_scheduler = NoiseScheduler(num_timesteps)
 
-        self.pos_emb = nn.Linear(spatial_dim, hidden_dim)
+        self.pos_emb = TorusMLP(ndim=spatial_dim)
         self.time_emb = FourierTimeEmbeddings(time_dim)
         self.drift_model = nn.Sequential(
             nn.Linear(hidden_dim + time_dim, hidden_dim),
@@ -171,31 +247,34 @@ class DiffusionModel(nn.Module):
 
         t_emb = self.time_emb(float_t).expand(batch_size, -1)
         x_emb = self.pos_emb(x)
-        pred_noise = self.drift_model(torch.cat([x_emb, t_emb], dim=-1))
+        out = self.drift_model(torch.cat([x_emb, t_emb], dim=-1))
         # (n, d)
-        return pred_noise
+        return out
 
-    def compute_score_matching_loss(self, x0: Tensor):
-        """
-        x0: shape (batch_size, spatial_dim)
-        """
-        batch_size = x0.shape[0]
-        device = x0.device
+    def compute_score_matching_loss(self, x: Tensor):
+        batch_size = x.shape[0]
+        device = x.device
 
-        times: Tensor = self.noise_scheduler.uniform_sample_timestep(batch_size, device)
-        alpha_bar = self.noise_scheduler.alpha_bar[times]
+        # ------------ Sample noise level
+        sampled_timesteps = self.noise_scheduler.uniform_sample_timestep(
+            batch_size=x.shape[0], device=device
+        )
         # (batch_size,)
-        # \sqrt{\bar{\alpha}}
-        c0 = torch.sqrt(alpha_bar)
-        # \sqrt{1-\bar{\alpha}}
-        c1 = torch.sqrt(1. - alpha_bar)
+        sigmas = self.noise_scheduler.sigmas[sampled_timesteps].view(*x.shape)
+        # (batch_size, spatial_dim)
+        sigmas_norm = self.noise_scheduler.sigmas_norm[sampled_timesteps].view(*x.shape)
 
-        # q(kt|k0) = N(sqrt(alpha_bar)k0, (1-alpha_bar)*I)
-        noise = torch.randn_like(x0)
-        xt = c0[:, None] * x0 + c1[:, None] * noise
+        noise = torch.randn_like(x)
+        with torch.no_grad():
+            noisy_x = (x + sigmas * noise) % 1.0
+            ground_truth_scores = d_log_p_wrapped_multivariate_normal(
+                sigmas * noise, sigmas
+            )
 
-        pred_noise = self(xt, times)
-        loss = F.mse_loss(pred_noise, noise)
+        predicted_scores = self(noisy_x, sampled_timesteps)
+        loss = F.mse_loss(
+            predicted_scores, ground_truth_scores / (torch.sqrt(sigmas_norm) + 1e-8)
+        )
         return loss
 
     def trajectory_log_probs(self, trajectories: Tensor):
@@ -234,39 +313,36 @@ class DiffusionModel(nn.Module):
                 (n, 2)
             x_t: torch.float
                 (n, 2)
-            t: torch.long
+            t: torch.float
                 (n,)
 
         Returns:
             (n,)
         """
-        alpha = self.noise_scheduler.alphas[t]
-        alpha_bar = self.noise_scheduler.alpha_bar[t]
-        sigma = self.noise_scheduler.sigmas[t]
+        device = x_t.device
+        batch_size = x_t.shape[0]
 
-        # 1/sqrt(alpha) = 1/sqrt(1-beta)
-        c0 = 1.0 / torch.sqrt(alpha)
-        # beta / sqrt(1-\bar{alpha})
-        c1 = (1. - alpha) / torch.sqrt(1 - alpha_bar)
+        sigma_norm_t_plus_1 = self.noise_scheduler.sigmas_norm[t+1][:, None]
+        sigma_norm_t = self.noise_scheduler.sigmas_norm[t][:, None]
+        # (n, 1)
 
         # --- Predictor
         # x_t <- x_t+1 + (sigma_t+1 ** 2 - sigma_t ** 2) * score(x_t+1, sigma_t+1)
         # z ~ N(0, I)
         # x_t <- x_t + sqrt(sigma_t+1 ** 2 - sigma_t ** 2) * z
-        pred_noise = self(x_t_plus1, t + 1)
-        # (n, d)
+        predicted_score = torch.sqrt(sigma_norm_t_plus_1) * self(x_t_plus1, t + 1)
 
-        """
-        noise = torch.randn_like(x_t_plus1)
-        x_t = c0 * (x_t_plus1 - c1 * pred_noise) + sigma * noise
-        """
-        mean = c0[:, None] * (x_t_plus1 - c1[:, None] * pred_noise)
-        std = sigma
+        sigma_sq_diff = (
+            self.noise_scheduler.sigmas[t+1] ** 2
+            - self.noise_scheduler.sigmas[t] ** 2
+        )[:, None]  # (n, 1)
 
-        step_log_probs = gaussian_log_pdf(x_t.detach(), mean, std)
+        mean = x_t_plus1 + sigma_sq_diff * predicted_score
+        std = torch.sqrt(sigma_sq_diff)
+        step_log_probs = wrapped_gaussian_log_pdf(x_t.detach(), mean, std)
+        # todo: use a pre-trained model
         with torch.no_grad():
-            # todo: use a pre-trained model
-            ref_log_probs = gaussian_log_pdf(x_t, x_t_plus1, std)
+            ref_log_probs = wrapped_gaussian_log_pdf(x_t, x_t_plus1, std)
         kl_div = kl_divergence(step_log_probs, ref_log_probs)
         return step_log_probs, kl_div
 
@@ -278,7 +354,7 @@ class DiffusionModel(nn.Module):
 
         t = num_timesteps-1
         if init_same_noise:  # DanceGRPO claims this stabilizes things
-            x_t = torch.rand(1, self.spatial_dim, device=device).expand(batch_size, -1)
+            x_t = torch.zeros(1, self.spatial_dim, device=device).expand(batch_size, -1)
         else:
             x_t = torch.rand(batch_size, self.spatial_dim, device=device)
 
@@ -292,6 +368,7 @@ class DiffusionModel(nn.Module):
         trajectories[:, t] = x_t
 
         step_log_probs = []  # todo
+        ts_used = []  # todo
         for step in range(num_timesteps-1):
             (
                 x_t_min1,           # (batch_size, 2)
@@ -299,6 +376,7 @@ class DiffusionModel(nn.Module):
                 ref_step_log_prob,  # (batch_size,)
             ) = self.sample_and_log_prob_step(x_t, t)
             step_log_probs.append(step_log_prob)
+            ts_used.append(t)
 
             log_probs = log_probs + step_log_prob
             ref_log_probs = ref_log_probs + ref_step_log_prob
@@ -308,45 +386,64 @@ class DiffusionModel(nn.Module):
             x_t = x_t_min1
             t = t-1
 
-        # print(torch.stack(step_log_probs, dim=-1))
-        # print(torch.tensor(ts_used))
-        # print(trajectories.view(-1))
+        # print(ts_used)
 
         x_0 = x_t
         # (batch_size, 2)
         return x_0, log_probs, ref_log_probs, kl_loss, trajectories, torch.flip(torch.stack(step_log_probs, dim=-1), dims=[-1])
 
-    def sample_and_log_prob_step(self, x: Tensor, t: int) -> (Tensor, Tensor, Tensor):
+    def sample_and_log_prob_step(
+        self,
+        x: Tensor,
+        t: int,
+        snr: float = 0.4,
+        max_step_size: float = 1e6,
+    ) -> (Tensor, Tensor, Tensor):
 
-        alpha = self.noise_scheduler.alphas[t]
-        alpha_bar = self.noise_scheduler.alpha_bar[t]
-        sigma = self.noise_scheduler.sigmas[t]
-
-        # 1/sqrt(alpha) = 1/sqrt(1-beta)
-        c0 = 1.0 / torch.sqrt(alpha)
-        # beta / sqrt(1-\bar{alpha})
-        c1 = (1. - alpha) / torch.sqrt(1 - alpha_bar)  # todo: this is nan at t=0
+        sigma_norm_t_plus_1 = self.noise_scheduler.sigmas_norm[t+1]
+        sigma_norm_t = self.noise_scheduler.sigmas_norm[t]
 
         # --- Predictor
         # x_t <- x_t+1 + (sigma_t+1 ** 2 - sigma_t ** 2) * score(x_t+1, sigma_t+1)
         # z ~ N(0, I)
         # x_t <- x_t + sqrt(sigma_t+1 ** 2 - sigma_t ** 2) * z
-        pred_noise = self(x, t+1)
-        # (n, d)
+        float_t = torch.tensor([t+1], dtype=torch.float, device=x.device)
+        predicted_score = torch.sqrt(sigma_norm_t_plus_1) * self(x, float_t)
 
+        sigma_sq_diff = (
+            self.noise_scheduler.sigmas[t+1] ** 2
+            - self.noise_scheduler.sigmas[t] ** 2
+        )  # (,)
         noise = torch.randn_like(x)
+
         x_t_plus1 = x
-
-        mean = c0 * (x_t_plus1 - c1 * pred_noise)
-        std = sigma
+        mean = x + sigma_sq_diff * predicted_score
+        std = torch.sqrt(sigma_sq_diff)
         x = mean + std * noise
-
-        step_log_probs = gaussian_log_pdf(x.detach(), mean, std)
+        step_log_prob = wrapped_gaussian_log_pdf(x.detach(), mean, std)
+        # todo: use a pre-trained model
         with torch.no_grad():
-            # todo: use a pre-trained model
-            ref_log_probs = gaussian_log_pdf(x, x_t_plus1, std)
+            ref_step_log_prob = wrapped_gaussian_log_pdf(x, x_t_plus1, std)
 
-        return x, step_log_probs, ref_log_probs
+        if not self.training:
+            # --- Corrector: Algo 4 in https://arxiv.org/pdf/2011.13456
+            # z ~ N(0, I)
+            # x_t <- x_t + eps_t * score(x_t, sigma_t) + sqrt(2 * eps_t) * z
+            with torch.no_grad():
+                # Corrector is meant to correct numerical errors from SDE sampling,
+                # not to be used for training
+                predicted_score = torch.sqrt(sigma_norm_t) * self(x, float_t)
+                noise = torch.randn_like(x)
+
+                noise_norm = (noise ** 2).sum(dim=-1).sqrt().mean()
+                grad_norm = (predicted_score ** 2).sum(dim=-1).sqrt().mean()
+                step_size = 2 * (snr * noise_norm / grad_norm).pow(2)
+                step_size.nan_to_num_(nan=0., posinf=max_step_size, neginf=-max_step_size)
+
+                mean = x + step_size * predicted_score
+                std = torch.sqrt(2 * step_size)
+                x = mean + std * noise
+        return x % 1.0, step_log_prob, ref_step_log_prob
 
     @torch.no_grad()
     def sample(self, batch_size: int, device: torch.device = "cpu") -> Tensor:
@@ -368,9 +465,12 @@ def compute_loss(
     method, log_probs, kl_loss, rewards, beta, old_log_probs, ratio_clip=1e-1
 ):
     # https://github.com/XueZeyue/DanceGRPO/blob/d97950b51def6e61fddda83b0dbcbc615b07997c/fastvideo/train_grpo_flux.py#L597
-    ratio = torch.exp(log_probs - old_log_probs.detach())
-    ratio = torch.clamp(ratio, 1.0 - ratio_clip, 1. + ratio_clip)
-    first_term = torch.mean(-rewards * ratio)
+    ratio = torch.exp(log_probs - old_log_probs.detach()).clamp(
+        min=1. - ratio_clip, max=1. + ratio_clip
+    )
+    unclipped_loss = -rewards * ratio
+    clipped_loss = -rewards * torch.clamp(ratio, 1.0 - ratio_clip, 1. + ratio_clip)
+    first_term = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
     kl_term = kl_loss.sum()
     loss = first_term + beta * kl_term
@@ -396,7 +496,7 @@ def plot_current_policy(
         plt.savefig(output_dir / f"diffusion_rl_{method}_epoch{epoch}.png")
         plt.close()
     elif model.spatial_dim == 1:
-        grid_x = torch.linspace(-5, 5, steps=25)
+        grid_x = torch.linspace(0, 1, steps=25).view(-1, 1)
         target_dist = reward_fn(grid_x)
         plt.plot(samples, torch.zeros_like(samples), "rx", alpha=0.5)
         plt.plot(grid_x, target_dist)
@@ -420,16 +520,52 @@ def plot_learning_curves(learning_curves, method):
     plt.close()
 
 
+@torch.no_grad()
+def plot_noise_scheduler_pdfs(model):
+    scheduler = model.noise_scheduler
+
+    xs = torch.linspace(0, 1, steps=99)
+    stds = scheduler.sigmas[None, None, :]
+
+    m = 5
+    translations = torch.arange(-m, m+1)
+    mu = torch.zeros_like(xs) + 0.5
+    mu = mu[:, None] + translations[None, :]
+    # (num_xs, n_translations)
+    log_pdf = -0.5 * (
+        math.log(2. * math.pi)
+        + 2 * torch.log(stds)
+        + (xs[:, None, None] - mu[..., None]).pow(2) / (stds.pow(2) + 1e-6)
+    )
+    log_pdf = torch.logsumexp(log_pdf, dim=1)
+    # (num_xs, num_sigmas)
+
+    cmap = plt.get_cmap('Blues')
+    idxs = torch.round(torch.linspace(0, stds.numel()-1, steps=10)).long()
+    for i in idxs:
+        pdf_i = log_pdf[:, i].exp()
+        pdf_i = pdf_i - pdf_i.min()
+        plt.plot(
+            xs,
+            pdf_i,
+            label=f"$\sigma$={stds[0, 0, i]:0.3f}, step={i}/{stds.numel()}",
+            # color=cmap((i + 1) / (idxs.max() + 1)),
+        )
+    plt.legend(frameon=False)
+    plt.xlabel("x")
+    plt.ylabel("Unnormalized PDF")
+    plt.savefig("wrapped_normal_pdfs.png")
+    plt.close()
+
+
 def pretrain():
     # pretrain model with score matching
     if os.path.exists(pretrained_model_path):
         return
 
-    lr = 1e-3
+    lr = 1e-4
 
-    model = DiffusionModel(
-        num_timesteps=num_timesteps, hidden_dim=hidden_dim, spatial_dim=spatial_dim
-    )
+    model = DiffusionModel(**model_kwargs)
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -448,8 +584,8 @@ def pretrain():
             torch.tensor([0.1, 0.1]).view(1, 2)
         )
     elif spatial_dim == 1:
-        dist1 = torch.distributions.Normal(torch.tensor([0.]), torch.tensor([1.]))
-        dist2 = Normal(torch.tensor([5.5]), torch.tensor(0.5))
+        dist1 = torch.distributions.Normal(torch.tensor([0.]), torch.tensor([0.05]))
+        dist2 = Normal(torch.tensor([0.5]), torch.tensor(0.05))
 
     dataset_size = 100
     data = torch.cat(
@@ -457,7 +593,7 @@ def pretrain():
             dist1.sample((math.ceil(dataset_size / 2),)),
             dist2.sample((math.floor(dataset_size / 2),))
         ], dim=0
-    )
+    ) % 1.0
     # (dataset_size, spatial_dim)
 
     # - Plot untrained model
@@ -470,7 +606,7 @@ def pretrain():
             plt.plot(samples[:, 0], torch.zeros(samples.shape[0]), "bo", alpha=0.5, label="samples")
             plt.plot(data[:, 0], .1 + torch.zeros(dataset_size), "rx", alpha=0.2, label="data")
         plt.legend(frameon=False)
-        plt.savefig(output_dir / f"untrained_model_samples.png")
+        plt.savefig(parent_dir / f"untrained_model_samples.png")
         plt.close()
 
     # - Train with score matching, plot samples
@@ -504,7 +640,7 @@ def pretrain():
         plt.plot(log_freq * np.array(list(range(len(losses)))), losses)
         plt.xlabel("Epoch")
         plt.ylabel("SM loss")
-        plt.savefig(output_dir / f"pretrain_loss.png")
+        plt.savefig(parent_dir / f"pretrain_loss.png")
         plt.close()
 
         samples = model.sample(100, device)
@@ -515,7 +651,7 @@ def pretrain():
             plt.plot(samples[:, 0], torch.zeros(samples.shape[0]), "bo", alpha=0.5, label="samples")
             plt.plot(data[:, 0], .1 + torch.zeros(dataset_size), "rx", alpha=0.2, label="data")
         plt.legend(frameon=False)
-        plt.savefig(output_dir / f"pretrained_model_samples.png")
+        plt.savefig(parent_dir / f"pretrained_model_samples.png")
         plt.close()
 
     # - Save model
@@ -524,10 +660,11 @@ def pretrain():
 
 def run(method: str, use_pretrained_model: bool = True):
     assert method in ["dpok", "grpo"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # hyperparameters
     lr = 5e-5
-    num_iterations = 5_001
+    num_iterations = 1_001
     batch_size = 64
     use_sparse_reward = False
     reward_temperature = 1.0
@@ -566,26 +703,25 @@ def run(method: str, use_pretrained_model: bool = True):
             device, sparse=use_sparse_reward, discrete_energy=False
         )
     elif spatial_dim == 1:
-        dist = torch.distributions.Normal(0, 1)
+        dist = torch.distributions.Normal(torch.tensor([0.5]), torch.tensor([0.05]))
         energy_fn: Callable = lambda x: -dist.log_prob(x)
-
-    reward_fn: Callable = (
-        lambda x: 10.0 * torch.exp(-energy_fn(x.detach()-0.5) / reward_temperature)
+    else:
+        raise AttributeError
+    reward_fn: Callable = functools.partial(
+        wrapped_reward_fn,
+        energy_fn=energy_fn,
+        reward_temperature=reward_temperature,
     )
 
     # -- Model
-    model = DiffusionModel(
-        num_timesteps=num_timesteps, hidden_dim=hidden_dim, spatial_dim=spatial_dim
-    )
+    model = DiffusionModel(**model_kwargs)
     model.to(device)
     model.train()
     if use_pretrained_model and os.path.exists(pretrained_model_path):
         print("Loaded pretrained model")
         model.load_state_dict(torch.load(pretrained_model_path, weights_only=True))
 
-    old_policy = DiffusionModel(
-        num_timesteps=num_timesteps, hidden_dim=hidden_dim, spatial_dim=spatial_dim
-    )
+    old_policy = DiffusionModel(**model_kwargs)
     old_policy.load_state_dict(model.state_dict())
     old_policy.train()
     for p in old_policy.parameters():
@@ -596,6 +732,7 @@ def run(method: str, use_pretrained_model: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # -- Plot samples against reward
+    plot_noise_scheduler_pdfs(model)
     plot_current_policy(model, reward_fn, device, method, 0)
 
     # -- Train
@@ -695,7 +832,17 @@ def run(method: str, use_pretrained_model: bool = True):
 
 
 if __name__ == "__main__":
-    # torch.autograd.set_detect_anomaly(True)
     pretrain()
     run(method="dpok")
 
+    # from cProfile import Profile
+    # from pstats import SortKey, Stats
+    #
+    # with Profile() as profile:
+    #      run(method="dpok")
+    #      (
+    #          Stats(profile)
+    #          .strip_dirs()
+    #          .sort_stats(SortKey.TIME)
+    #          .print_stats()
+    #      )

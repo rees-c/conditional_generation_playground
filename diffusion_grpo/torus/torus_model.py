@@ -833,7 +833,8 @@ def run(method: str, use_pretrained_model: bool = True):
 
 if __name__ == "__main__":
     pretrain()
-    run(method="dpok")
+    run(method="dpok", use_pretrained_model=False)
+    # use_pretrained_model=True leads to worse performance
 
     # from cProfile import Profile
     # from pstats import SortKey, Stats

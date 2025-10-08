@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from common_utils import AverageMeter
 from rewards import get_energy_function
 from grpo.utils import update_old_policy
-from diffusion_grpo.model_utils import FourierTimeEmbeddings
+from diffusion_reinforce.model_utils import FourierTimeEmbeddings
 
 Tensor: type = torch.Tensor
 
@@ -519,6 +519,12 @@ def plot_learning_curves(learning_curves, method):
     plt.savefig(output_dir / f"diffusion_rl_curves_{method}.png")
     plt.close()
 
+    plt.plot(xs, learning_curves["reward"])
+    plt.ylabel("Reward")
+    plt.xlabel("Iteration")
+    plt.savefig(output_dir / "reward.png")
+    plt.close()
+
 
 @torch.no_grad()
 def plot_noise_scheduler_pdfs(model):
@@ -832,9 +838,11 @@ def run(method: str, use_pretrained_model: bool = True):
 
 
 if __name__ == "__main__":
-    pretrain()
-    run(method="dpok", use_pretrained_model=False)
     # use_pretrained_model=True leads to worse performance
+    use_pretrained_model = False
+    if use_pretrained_model:
+        pretrain()
+    run(method="dpok", use_pretrained_model=use_pretrained_model)
 
     # from cProfile import Profile
     # from pstats import SortKey, Stats

@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+import torch.multiprocessing as mp
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -398,6 +399,7 @@ class DiffusionModel(nn.Module):
         t: int,
         snr: float = 0.4,
         max_step_size: float = 1e6,
+        greedy_decoding: bool = False,
     ) -> (Tensor, Tensor, Tensor):
 
         sigma_norm_t_plus_1 = self.noise_scheduler.sigmas_norm[t+1]
@@ -419,7 +421,10 @@ class DiffusionModel(nn.Module):
         x_t_plus1 = x
         mean = x + sigma_sq_diff * predicted_score
         std = torch.sqrt(sigma_sq_diff)
-        x = mean + std * noise
+        if greedy_decoding:
+            x = mean
+        else:
+            x = mean + std * noise
         step_log_prob = wrapped_gaussian_log_pdf(x.detach(), mean, std)
         # todo: use a pre-trained model
         with torch.no_grad():
@@ -446,15 +451,25 @@ class DiffusionModel(nn.Module):
         return x % 1.0, step_log_prob, ref_step_log_prob
 
     @torch.no_grad()
-    def sample(self, batch_size: int, device: torch.device = "cpu") -> Tensor:
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device = "cpu",
+        initial_state: Optional[Tensor] = None,
+        greedy_decoding: bool = False,  # denoising steps predict expectation
+    ) -> Tensor:
         _training = self.training
         self.training = False
 
         num_timesteps = self.noise_scheduler.num_timesteps
-        x = torch.rand(batch_size, self.spatial_dim, device=device)
         t = num_timesteps-1
+        if initial_state is None:
+            x = torch.rand(batch_size, self.spatial_dim, device=device)
+        else:
+            x = initial_state
+
         for step in range(num_timesteps-1):
-            x = self.sample_and_log_prob_step(x, t)[0]
+            x = self.sample_and_log_prob_step(x, t, greedy_decoding=greedy_decoding)[0]
             t = t-1
 
         self.training = _training
@@ -664,82 +679,29 @@ def pretrain():
     torch.save(model.state_dict(), pretrained_model_path)
 
 
-def run(method: str, use_pretrained_model: bool = True):
-    assert method in ["dpok", "grpo"]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # hyperparameters
-    lr = 5e-5
-    num_iterations = 1_001
-    batch_size = 64
-    use_sparse_reward = False
-    reward_temperature = 1.0
-    use_ema = False  # ema leads to no learning
-    ema_decay = 0.99
-    old_policy_update_freq = 1 if use_ema else 100
-    epsilon = 0.1  # 0.2 instead of 0.1 leads to slow learning
-    beta = 0.0
-    n_log_prints = 10
-    num_inner_steps = 4
-    normalize_advantages = False
-    log_freq = int(num_iterations / n_log_prints)
-    inner_batch_size = int(batch_size / num_inner_steps)
-    init_same_noise = False  # DanceGRPO claims this stabilizes training
-    assert batch_size % num_inner_steps == 0
-    assert batch_size > 1
-
-    config = {
-        "seed": seed,
-        "lr": lr, "num_iterations": num_iterations, "batch_size": batch_size,
-        "use_sparse_reward": use_sparse_reward,
-        "reward_temperature": reward_temperature,
-        "use_ema": use_ema, "old_policy_update_freq": old_policy_update_freq,
-        "epsilon": epsilon, "beta": beta, "num_inner_steps": num_inner_steps,
-        "num_timesteps": num_timesteps, "hidden_dim": hidden_dim,
-        "spatial_dim": spatial_dim, "use_pretrained_model": use_pretrained_model,
-        "normalize_advantages": normalize_advantages,
-        "ema_decay": ema_decay,
-    }
-    print(config)
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config, f)
-
-    if spatial_dim == 2:
-        energy_fn: nn.Module = get_energy_function(
-            device, sparse=use_sparse_reward, discrete_energy=False
-        )
-    elif spatial_dim == 1:
-        dist = torch.distributions.Normal(torch.tensor([0.5]), torch.tensor([0.05]))
-        energy_fn: Callable = lambda x: -dist.log_prob(x)
-    else:
-        raise AttributeError
-    reward_fn: Callable = functools.partial(
-        wrapped_reward_fn,
-        energy_fn=energy_fn,
-        reward_temperature=reward_temperature,
-    )
-
-    # -- Model
-    model = DiffusionModel(**model_kwargs)
-    model.to(device)
-    model.train()
-    if use_pretrained_model and os.path.exists(pretrained_model_path):
-        print("Loaded pretrained model")
-        model.load_state_dict(torch.load(pretrained_model_path, weights_only=True))
-
+def run_dpok(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    num_iterations: int,
+    normalize_advantages: bool,
+    batch_size: int,
+    init_same_noise: bool,
+    reward_fn: Callable,
+    use_ema: bool,
+    ema_decay: float,
+    num_inner_steps: int,
+    inner_batch_size: int,
+    old_policy_update_freq: int,
+    log_freq: int,
+    beta: float,
+    epsilon: float,
+):
     old_policy = DiffusionModel(**model_kwargs)
     old_policy.load_state_dict(model.state_dict())
     old_policy.train()
     for p in old_policy.parameters():
         p.requires_grad = False
     old_policy.to(device)
-
-    # -- Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # -- Plot samples against reward
-    plot_noise_scheduler_pdfs(model)
-    plot_current_policy(model, reward_fn, device, method, 0)
 
     # -- Train
     meters = {"loss": AverageMeter(), "reward": AverageMeter(), "grad": AverageMeter()}
@@ -831,18 +793,198 @@ def run(method: str, use_pretrained_model: bool = True):
             print(metric_str)
             for meter in meters.values():
                 meter.reset()
+    plot_learning_curves(learning_curves, method)
+
+
+@torch.no_grad()
+def run_evolutionary_search(
+    model: nn.Module,
+    num_iterations: int,
+    reward_fn: Callable,
+    log_freq: int,
+):
+    """https://arxiv.org/pdf/2509.24372"""
+    population_size = 30
+    noise_scale = 0.0015
+    learning_rate = 0.0005
+    batch_size = 32
+
+    seeds = torch.randint(-100, 100, (population_size,))
+    max_rewards, min_rewards, mean_rewards = [], [], []
+    for iter in range(num_iterations):
+
+        xT = torch.rand(batch_size, 1, device=device)
+        rewards = torch.zeros(population_size, device=device)
+        for i in range(population_size):  # todo: multiprocess this loop
+
+            # Noise model in-place
+            for name, param in model.named_parameters():
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(seeds[i]))
+                param_noise = noise_scale * torch.randn(
+                    param.shape,
+                    generator=gen,
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                param.data.add_(param_noise)
+                del param_noise
+
+            # Sample from noised model
+            samples = model.sample(
+                1, device, initial_state=xT, greedy_decoding=True
+            )
+            rewards[i] = reward_fn(samples).mean()
+
+            # Restore original weights in-place
+            for name, param in model.named_parameters():
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(seeds[i]))
+                param_noise = noise_scale * torch.randn(
+                    param.shape,
+                    generator=gen,
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                param.data.add_(-param_noise)
+                del param_noise
+
+        # Normalize reward
+        r_mean = rewards.mean()
+        r_std = rewards.std()
+        r_max = rewards.max()
+        r_min = rewards.min()
+        rewards_normalized = (rewards - r_mean) / (r_std + 1e-8)
+        max_rewards.append(r_max)
+        min_rewards.append(r_min)
+        mean_rewards.append(r_mean)
+        if iter % log_freq == 0:
+            print(f"Iter {iter} reward avg: {r_mean}")
+
+        # update model
+        for name, param in model.named_parameters():
+            gen = torch.Generator(device=param.device)
+            update = torch.zeros_like(param)
+            for seed_idx in range(population_size):
+                r_norm = rewards_normalized[seed_idx]
+                seed = seeds[seed_idx]
+                gen.manual_seed(int(seed))
+                noise = torch.randn(
+                    param.shape,
+                    generator=gen,
+                    device=param.device,
+                    dtype=param.dtype
+                )
+                noise.mul_(float(r_norm))
+                update.add_(noise)
+                del noise
+            update.div_(population_size)
+            param.data.add_(learning_rate * update)
+
+    xs = list(range(num_iterations))
+    plt.plot(xs, mean_rewards, 'k-')
+    plt.plot(xs, min_rewards, 'k--')
+    plt.plot(xs, max_rewards, 'k--')
+    plt.xlabel("Iteration")
+    plt.ylabel("Reward")
+    plt.savefig("es_rewards.png")
+    plt.close()
+
+
+def run(method: str, use_pretrained_model: bool = True):
+    assert method in ["dpok", "es"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # hyperparameters
+    lr = 5e-5
+    num_iterations = 1_001
+    batch_size = 64
+    use_sparse_reward = False
+    reward_temperature = 1.0
+    use_ema = False  # ema leads to no learning
+    ema_decay = 0.99
+    old_policy_update_freq = 1 if use_ema else 100
+    epsilon = 0.1  # 0.2 instead of 0.1 leads to slow learning
+    beta = 0.0
+    n_log_prints = 10
+    num_inner_steps = 4
+    normalize_advantages = False
+    log_freq = int(num_iterations / n_log_prints)
+    inner_batch_size = int(batch_size / num_inner_steps)
+    init_same_noise = False  # DanceGRPO claims this stabilizes training
+    assert batch_size % num_inner_steps == 0
+    assert batch_size > 1
+
+    config = {
+        "seed": seed,
+        "lr": lr, "num_iterations": num_iterations, "batch_size": batch_size,
+        "use_sparse_reward": use_sparse_reward,
+        "reward_temperature": reward_temperature,
+        "use_ema": use_ema, "old_policy_update_freq": old_policy_update_freq,
+        "epsilon": epsilon, "beta": beta, "num_inner_steps": num_inner_steps,
+        "num_timesteps": num_timesteps, "hidden_dim": hidden_dim,
+        "spatial_dim": spatial_dim, "use_pretrained_model": use_pretrained_model,
+        "normalize_advantages": normalize_advantages,
+        "ema_decay": ema_decay,
+    }
+    print(config)
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config, f)
+
+    if spatial_dim == 2:
+        energy_fn: nn.Module = get_energy_function(
+            device, sparse=use_sparse_reward, discrete_energy=False
+        )
+    elif spatial_dim == 1:
+        dist = torch.distributions.Normal(torch.tensor([0.5]), torch.tensor([0.05]))
+        energy_fn: Callable = lambda x: -dist.log_prob(x)
+    else:
+        raise AttributeError
+    reward_fn: Callable = functools.partial(
+        wrapped_reward_fn,
+        energy_fn=energy_fn,
+        reward_temperature=reward_temperature,
+    )
+
+    # -- Model
+    model = DiffusionModel(**model_kwargs)
+    model.to(device)
+    model.train()
+    if use_pretrained_model and os.path.exists(pretrained_model_path):
+        print("Loaded pretrained model")
+        model.load_state_dict(torch.load(pretrained_model_path, weights_only=True))
+
+    # -- Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # -- Plot samples against reward
+    plot_noise_scheduler_pdfs(model)
+    plot_current_policy(model, reward_fn, device, method, 0)
+
+    if method == "dpok":
+        run_dpok(
+            model, optimizer, num_iterations, normalize_advantages,
+            batch_size, init_same_noise, reward_fn, use_ema, ema_decay,
+            num_inner_steps, inner_batch_size, old_policy_update_freq,
+            log_freq, beta, epsilon,
+        )
+    elif method == "es":
+        run_evolutionary_search(model, num_iterations, reward_fn, log_freq)
+    else:
+        raise AttributeError
 
     # plot samples against reward
     plot_current_policy(model, reward_fn, device, method, num_iterations)
-    plot_learning_curves(learning_curves, method)
 
 
 if __name__ == "__main__":
     # use_pretrained_model=True leads to worse performance
     use_pretrained_model = False
+    method = "es"
+    assert method in ["dpok", "es"]
     if use_pretrained_model:
         pretrain()
-    run(method="dpok", use_pretrained_model=use_pretrained_model)
+    run(method=method, use_pretrained_model=use_pretrained_model)
 
     # from cProfile import Profile
     # from pstats import SortKey, Stats

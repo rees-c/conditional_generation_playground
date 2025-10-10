@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime
 import os
 import functools
+from queue import Empty
 
 import torch
 import torch.nn as nn
@@ -796,31 +797,24 @@ def run_dpok(
     plot_learning_curves(learning_curves, method)
 
 
-@torch.no_grad()
-def run_evolutionary_search(
-    model: nn.Module,
-    num_iterations: int,
+def process_es_worker(
+    xT: Tensor,
+    seed_idxs: List[int],
+    seeds: List[int],
+    worker_model: nn.Module,
+    rewards: List[float],
+    barrier: mp.Barrier,
+    noise_scale: float,
     reward_fn: Callable,
-    log_freq: int,
+    num_iterations: int,
 ):
-    """https://arxiv.org/pdf/2509.24372"""
-    population_size = 30
-    noise_scale = 0.0015
-    learning_rate = 0.0005
-    batch_size = 32
-
-    seeds = torch.randint(-100, 100, (population_size,))
-    max_rewards, min_rewards, mean_rewards = [], [], []
+    worker_id = mp.current_process()._identity[0] - 1  # starts at 1
     for iter in range(num_iterations):
-
-        xT = torch.rand(batch_size, 1, device=device)
-        rewards = torch.zeros(population_size, device=device)
-        for i in range(population_size):  # todo: multiprocess this loop
-
+        for seed_idx, seed in zip(seed_idxs, seeds):
             # Noise model in-place
-            for name, param in model.named_parameters():
+            for name, param in worker_model.named_parameters():
                 gen = torch.Generator(device=param.device)
-                gen.manual_seed(int(seeds[i]))
+                gen.manual_seed(int(seed))
                 param_noise = noise_scale * torch.randn(
                     param.shape,
                     generator=gen,
@@ -831,15 +825,15 @@ def run_evolutionary_search(
                 del param_noise
 
             # Sample from noised model
-            samples = model.sample(
-                1, device, initial_state=xT, greedy_decoding=True
+            samples = worker_model.sample(
+                None, device, initial_state=xT, greedy_decoding=True
             )
-            rewards[i] = reward_fn(samples).mean()
+            avg_reward = reward_fn(samples).mean()
 
             # Restore original weights in-place
-            for name, param in model.named_parameters():
+            for name, param in worker_model.named_parameters():
                 gen = torch.Generator(device=param.device)
-                gen.manual_seed(int(seeds[i]))
+                gen.manual_seed(int(seed))
                 param_noise = noise_scale * torch.randn(
                     param.shape,
                     generator=gen,
@@ -849,20 +843,92 @@ def run_evolutionary_search(
                 param.data.add_(-param_noise)
                 del param_noise
 
+            # Update results
+            rewards[seed_idx] = avg_reward
+
+        barrier.wait()  # wait for all workers to finish the round
+        barrier.wait()  # wait for main process to update seeds + base model
+
+
+@torch.no_grad()
+def run_evolutionary_search(
+    base_model: nn.Module,
+    num_iterations: int,
+    reward_fn: Callable,
+    log_freq: int,
+):
+    """https://arxiv.org/pdf/2509.24372"""
+    population_size = 12  # default is 30
+    noise_scale = 0.01
+    learning_rate = noise_scale / 2
+    batch_size_per_seed = 32
+
+    use_gpu = torch.cuda.is_available()
+    nprocs = torch.cuda.device_count() if use_gpu else min(12, os.cpu_count())
+    print(f"Num processes: {nprocs}/{os.cpu_count()}")
+
+    # Initialize seeds
+    seeds = np.random.randint(
+        0, 2**30, size=population_size, dtype=np.int64
+    ).tolist()
+    seed_idxs = list(range(population_size))
+    if len(seeds) < nprocs:
+        raise NotImplementedError
+
+    # Copy model to each process
+    model_list = []
+    for _ in range(nprocs):
+        worker_model = DiffusionModel(**model_kwargs).to(device)
+        worker_model.load_state_dict(base_model.state_dict())
+        model_list.append(worker_model)
+
+    # Start workers
+    manager = mp.Manager()
+    workers = []
+    rewards = manager.list([None] * population_size)  # thread-safe container for outputs
+    barrier = mp.Barrier(nprocs + 1)  # +1 for main process
+    xT = torch.rand(batch_size_per_seed, base_model.spatial_dim, device=device)
+    for worker_idx in range(nprocs):
+        p = mp.Process(
+            target=process_es_worker,
+            args=(
+                xT,
+                seed_idxs[worker_idx::nprocs],
+                seeds[worker_idx::nprocs],
+                model_list[worker_idx],
+                rewards,
+                barrier,
+                noise_scale,
+                reward_fn,
+                num_iterations,
+            ),
+        )
+        p.start()
+        workers.append(p)
+
+    rewards_meter = AverageMeter()
+    max_rewards, min_rewards, mean_rewards = [], [], []
+    for iter in range(num_iterations):
+        # Wait for all workers to finish this round
+        barrier.wait()
+
         # Normalize reward
-        r_mean = rewards.mean()
-        r_std = rewards.std()
-        r_max = rewards.max()
-        r_min = rewards.min()
-        rewards_normalized = (rewards - r_mean) / (r_std + 1e-8)
+        rewards_tensor = torch.tensor(rewards, device=device)
+        r_mean = rewards_tensor.mean()
+        r_std = rewards_tensor.std()
+        r_max = rewards_tensor.max()
+        r_min = rewards_tensor.min()
+        rewards_normalized = (rewards_tensor - r_mean) / (r_std + 1e-8)
         max_rewards.append(r_max)
         min_rewards.append(r_min)
         mean_rewards.append(r_mean)
+        rewards_meter.update(r_mean)
         if iter % log_freq == 0:
-            print(f"Iter {iter} reward avg: {r_mean}")
+            print(f"Iter {iter} reward avg: {rewards_meter.avg}, {rewards}")
+            rewards_meter.reset()
 
-        # update model
-        for name, param in model.named_parameters():
+        # update base model
+        for name, param in base_model.named_parameters():
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
             for seed_idx in range(population_size):
@@ -881,6 +947,27 @@ def run_evolutionary_search(
             update.div_(population_size)
             param.data.add_(learning_rate * update)
 
+        # update worker models with new base model
+        for model_idx in range(nprocs):
+            worker_model = model_list[model_idx]
+            for name, param in worker_model.named_parameters():
+                param.data.copy_(base_model.get_parameter(name).data.clone())
+
+        # Update seeds and xT
+        _xT = torch.rand(batch_size_per_seed, base_model.spatial_dim, device=xT.device)
+        xT.mul_(0.)
+        xT.add_(_xT)
+        seeds = np.random.randint(
+            0, 2**30, size=population_size, dtype=np.int64
+        ).tolist()
+
+        # Allow all workers to load the new base model
+        barrier.wait()
+
+    # Finish processes
+    for worker in workers:
+        worker.join()
+
     xs = list(range(num_iterations))
     plt.plot(xs, mean_rewards, 'k-')
     plt.plot(xs, min_rewards, 'k--')
@@ -891,9 +978,16 @@ def run_evolutionary_search(
     plt.close()
 
 
+def get_nll_from_dist(x, dist):
+    return -dist.log_prob(x)
+
+
 def run(method: str, use_pretrained_model: bool = True):
     assert method in ["dpok", "es"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if method == "es":
+        mp.set_start_method("spawn", force=True)
 
     # hyperparameters
     lr = 5e-5
@@ -937,7 +1031,7 @@ def run(method: str, use_pretrained_model: bool = True):
         )
     elif spatial_dim == 1:
         dist = torch.distributions.Normal(torch.tensor([0.5]), torch.tensor([0.05]))
-        energy_fn: Callable = lambda x: -dist.log_prob(x)
+        energy_fn: Callable = functools.partial(get_nll_from_dist, dist=dist)
     else:
         raise AttributeError
     reward_fn: Callable = functools.partial(
